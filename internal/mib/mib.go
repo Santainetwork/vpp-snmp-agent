@@ -36,21 +36,21 @@ type LCPPair struct {
 
 // CounterSet holds summed-thread counters for one interface (position in Names).
 type CounterSet struct {
-	RXOctets, RXPackets      uint64
-	RXMulticast, RXBroadcast uint64
+	RXOctets, RXPackets       uint64
+	RXMulticast, RXBroadcast  uint64
 	RXNoBuf, RXError, RxDrops uint64
-	TXOctets, TXPackets      uint64
-	TXMulticast, TXBroadcast uint64
-	TXError                  uint64
+	TXOctets, TXPackets       uint64
+	TXMulticast, TXBroadcast  uint64
+	TXError                   uint64
 }
 
 // Snapshot is the input to Build: everything needed to render one IF-MIB update.
 type Snapshot struct {
-	Names     []string
-	Counters  []CounterSet
-	Ifaces    map[string]Interface
-	LCPPairs  map[string]LCPPair
-	Config    Config
+	Names    []string
+	Counters []CounterSet
+	Ifaces   map[string]Interface
+	LCPPairs map[string]LCPPair
+	Config   Config
 }
 
 func u32(v uint64) uint32 {
