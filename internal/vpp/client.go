@@ -1,87 +1,117 @@
-// Package vpp implements VPP binary-API and stats-segment clients built on
-// the current govpp snapshot (c02eb51f8588).
+// Package vpp implements VPP binary-API inventory and stats-segment counters
+// on top of govpp (snapshot c02eb51f8588, module go.fd.io/govpp).
 //
-// Compatibility note: interface fields are taken from the generated
-// binapi/interface (SwInterfaceDetails, CRC aa610c27) and binapi/lcp
-// (LcpItfPairDetails, CRC 8b5481af) bindings. govpp negotiates the CRC at
-// Connect time; if a newer VPP drops either message the RPC call returns
-// api.ErrUnknownMsg and we surface it to the caller. LCP is treated as
-// optional per task spec: failures are logged, never fatal for base
-// interface inventory. The stats segment is read via adapter/statsclient,
-// which understands statseg v2 (and v1); we never mmap manually.
+// Compatibility: interface data comes from the generated binapi bindings
+// (binapi/interface SwInterfaceDetails CRC 6c221fc7, binapi/lcp
+// LcpItfPairDetails CRC 8b5481af). govpp resolves message CRCs at Connect
+// time, so a VPP release that drops or changes a message surfaces as a
+// VPPApiError; we never hand-encode API messages. LCP is optional: if the
+// plugin is absent, LCPPairs returns an empty map.
+//
+// Counters are read through adapter/statsclient, the pure-Go stats client that
+// speaks statseg v1 and v2. No manual mmap. Per-worker vectors are summed to a
+// single per-interface value, matching the Python agent's [:, i].sum() use.
 package vpp
 
 import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
+	"log/slog"
 	"sync"
 	"time"
 
 	"go.fd.io/govpp/adapter/socketclient"
 	"go.fd.io/govpp/api"
 	"go.fd.io/govpp/binapi/interface_types"
-	"go.fd.io/govpp/binapi/memclnt"
 	"go.fd.io/govpp/core"
 
 	itf "go.fd.io/govpp/binapi/interface"
 	lcp "go.fd.io/govpp/binapi/lcp"
+
+	"github.com/santainetwork/vpp-snmp-agent/internal/mib"
 )
 
-// Default API socket path. Override with WithSocket.
-const DefaultAPISocket = "/run/vpp/api.sock"
+const (
+	// DefaultAPISocket is the VPP binary API socket.
+	DefaultAPISocket = "/run/vpp/api.sock"
+	// DefaultStatsSocket is the VPP stats segment socket.
+	DefaultStatsSocket = "/run/vpp/stats.sock"
+	// DefaultTimeout bounds every RPC when the caller's context has no deadline.
+	DefaultTimeout = 5 * time.Second
+)
 
-// RPC timeout used for every binapi call.
-const DefaultRPCTimeout = 3 * time.Second
-
-// ErrNotConnected is returned by methods that require an established
-// connection if Connect has not succeeded (or the peer dropped).
+// ErrNotConnected is returned when an operation needs a live VPP connection.
 var ErrNotConnected = errors.New("vpp: not connected")
 
-// ErrLCPUnavailable is returned when the lcp plugin is absent or its API
-// schema does not match the generated binding. Callers treat this as "no
-// LCP pairs" rather than a hard failure.
-var ErrLCPUnavailable = errors.New("vpp: lcp plugin unavailable")
+// Options configures a Client.
+type Options struct {
+	Logger      *slog.Logger
+	PollPeriod  time.Duration
+	Socket      string
+	StatsSocket string
+	Timeout     time.Duration
+}
 
-// Client wraps a govpp core.Connection to the VPP binary API.
+// Client owns the binary API connection plus the stats segment connection.
 type Client struct {
-	mu       sync.Mutex
-	conn     *core.Connection
-	sockPath string
-	timeout  time.Duration
-	closed   bool
+	opts Options
+	log  *slog.Logger
+
+	mu     sync.Mutex
+	conn   *core.Connection
+	closed bool
+
+	stats *StatsClient
 }
 
-// ClientOption configures a Client.
-type ClientOption func(*Client)
-
-// WithSocket overrides the binary API socket path.
-func WithSocket(path string) ClientOption {
-	return func(c *Client) { c.sockPath = path }
-}
-
-// WithTimeout overrides the per-RPC context timeout.
-func WithTimeout(d time.Duration) ClientOption {
-	return func(c *Client) { c.timeout = d }
-}
-
-// NewClient builds a Client. It does not connect; call Connect.
-func NewClient(opts ...ClientOption) *Client {
-	c := &Client{
-		sockPath: DefaultAPISocket,
-		timeout:  DefaultRPCTimeout,
+// NewClient builds a Client. It does not connect.
+func NewClient(opts Options) *Client {
+	if opts.Socket == "" {
+		opts.Socket = DefaultAPISocket
 	}
-	for _, o := range opts {
-		o(c)
+	if opts.StatsSocket == "" {
+		opts.StatsSocket = DefaultStatsSocket
+	}
+	if opts.Timeout <= 0 {
+		opts.Timeout = DefaultTimeout
+	}
+	if opts.Logger == nil {
+		opts.Logger = slog.New(slog.DiscardHandler)
+	}
+	c := &Client{opts: opts, log: opts.Logger}
+	if opts.PollPeriod > 0 {
+		retry := opts.PollPeriod
+		if retry > 3*time.Second {
+			retry = 3 * time.Second
+		}
+		c.stats = NewStatsClient(StatsOptions{
+			Socket:       opts.StatsSocket,
+			RetryTimeout: retry,
+			Logger:       opts.Logger,
+		})
+	} else {
+		c.stats = NewStatsClient(StatsOptions{
+			Socket: opts.StatsSocket,
+			Logger: opts.Logger,
+		})
 	}
 	return c
 }
 
-// Connect establishes the binary API connection and enables interface event
-// notifications so callers can cheaply invalidate their cached views. A
-// failure to enable events is non-fatal (older VPP builds may not have the
-// message); the inventory calls still work.
-func (c *Client) Connect() error {
+// Connect opens the binary API and stats connections. Idempotent.
+func (c *Client) Connect(ctx context.Context) error {
+	if err := c.connectAPI(ctx); err != nil {
+		return err
+	}
+	if err := c.stats.Connect(); err != nil {
+		c.log.Warn("vpp stats connect failed; counters unavailable until reconnect", "err", err)
+	}
+	return nil
+}
+
+func (c *Client) connectAPI(ctx context.Context) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.conn != nil {
@@ -90,126 +120,184 @@ func (c *Client) Connect() error {
 	if c.closed {
 		return errors.New("vpp: client closed")
 	}
-	adapter := socketclient.NewVppClient(c.sockPath)
-	conn, err := core.Connect(adapter)
+	conn, err := core.Connect(socketclient.NewVppClient(c.opts.Socket))
 	if err != nil {
-		return fmt.Errorf("vpp: connect %s: %w", c.sockPath, err)
+		return fmt.Errorf("vpp: connect %s: %w", c.opts.Socket, err)
 	}
 	c.conn = conn
 
-	// Best-effort: ask VPP to push sw_interface_event notifications.
-	ctx, cancel := context.WithTimeout(context.Background(), c.timeout)
+	// Best effort: ask VPP to publish sw_interface_event notifications so a
+	// future cache layer can invalidate cheaply. Failure is not fatal.
+	rpcCtx, cancel := context.WithTimeout(detach(ctx), c.opts.Timeout)
 	defer cancel()
-	var e memclnt.ControlPing
-	var r memclnt.ControlPingReply
-	if err := conn.Invoke(ctx, &e, &r); err != nil {
-		// Ping failing is fine — some minimal builds answer only later.
-		_ = err
-	}
-	if svc := itf.NewServiceClient(conn); svc != nil {
-		var w itf.WantInterfaceEvents
-		w.EnableDisable = true
-		var wr itf.WantInterfaceEventsReply
-		_ = conn.Invoke(ctx, &w, &wr)
+	var w itf.WantInterfaceEvents
+	w.EnableDisable = 1
+	var wr itf.WantInterfaceEventsReply
+	if err := conn.Invoke(rpcCtx, &w, &wr); err != nil {
+		c.log.Debug("vpp: want_interface_events failed", "err", err)
 	}
 	return nil
 }
 
-// Disconnect closes the underlying connection.
-func (c *Client) Disconnect() error {
+// Disconnect closes both connections.
+func (c *Client) Disconnect() {
 	c.mu.Lock()
-	defer c.mu.Unlock()
-	if c.closed {
-		return nil
-	}
-	c.closed = true
 	if c.conn != nil {
 		c.conn.Disconnect()
 		c.conn = nil
 	}
-	return nil
-}
-
-// connLocked returns the live connection or an error. Caller must hold c.mu.
-func (c *Client) connLocked() (*core.Connection, error) {
-	if c.conn == nil {
-		return nil, ErrNotConnected
-	}
-	return c.conn, nil
-}
-
-// Interfaces dumps all software interfaces via SwInterfaceDump and returns
-// them in VPP sw_if_index order. Cached internally until Disconnect.
-func (c *Client) Interfaces(ctx context.Context) ([]Interface, error) {
-	c.mu.Lock()
-	conn, err := c.connLocked()
+	c.closed = true
 	c.mu.Unlock()
-	if err != nil {
-		return nil, err
-	}
-	if ctx == nil {
-		var cancel context.CancelFunc
-		ctx, cancel = context.WithTimeout(context.Background(), c.timeout)
-		defer cancel()
-	}
-	svc := itf.NewServiceClient(conn)
-	stream, err := svc.SwInterfaceDump(ctx, &itf.SwInterfaceDump{
-		SwIfIndex: interface_types.InterfaceIndex(0xFFFFFFFF), // ~0 = all
+	c.stats.Disconnect()
+}
+
+// Interfaces returns the interface inventory keyed by VPP interface name.
+func (c *Client) Interfaces(ctx context.Context) (map[string]mib.Interface, error) {
+	out := make(map[string]mib.Interface)
+	err := c.withConn(ctx, func(conn *core.Connection, rpcCtx context.Context) error {
+		svc := itf.NewServiceClient(conn)
+		stream, err := svc.SwInterfaceDump(rpcCtx, &itf.SwInterfaceDump{
+			SwIfIndex: interface_types.InterfaceIndex(0xFFFFFFFF), // ~0 = all
+		})
+		if err != nil {
+			return fmt.Errorf("sw_interface_dump: %w", err)
+		}
+		for {
+			d, err := stream.Recv()
+			if errors.Is(err, io.EOF) {
+				return nil
+			}
+			if err != nil {
+				return fmt.Errorf("sw_interface_dump recv: %w", err)
+			}
+			iface := ifaceFromDetails(d)
+			out[iface.Name] = iface
+		}
 	})
 	if err != nil {
-		// Connection likely dropped; surface so callers can reconnect.
-		return nil, fmt.Errorf("vpp: sw_interface_dump: %w", err)
-	}
-	out := make([]Interface, 0, 8)
-	for {
-		details, err := stream.Recv()
-		if errors.Is(err, api.ErrEndOfStream) || errors.Is(err, api.ErrStreamClosed) {
-			break
-		}
-		if err != nil {
-			return nil, fmt.Errorf("vpp: sw_interface_dump recv: %w", err)
-		}
-		out = append(out, newInterfaceFromDetails(details))
+		return nil, err
 	}
 	return out, nil
 }
 
-// LCPPairs returns Linux Control Plane interface pairs. Missing lcp plugin
-// yields (nil, ErrLCPUnavailable); every other error is returned as-is.
-func (c *Client) LCPPairs(ctx context.Context) ([]LCPPair, error) {
-	c.mu.Lock()
-	conn, err := c.connLocked()
-	c.mu.Unlock()
-	if err != nil {
-		return nil, err
-	}
-	if ctx == nil {
-		var cancel context.CancelFunc
-		ctx, cancel = context.WithTimeout(context.Background(), c.timeout)
-		defer cancel()
-	}
-	svc := lcp.NewServiceClient(conn)
-	stream, err := svc.LcpItfPairGet(ctx, &lcp.LcpItfPairGet{})
-	if err != nil {
-		if errors.Is(err, api.ErrUnknownMsg) {
-			return nil, ErrLCPUnavailable
-		}
-		// Many VPP builds return a generic error if the plugin is not loaded.
-		return nil, fmt.Errorf("%w: %v", ErrLCPUnavailable, err)
-	}
-	out := make([]LCPPair, 0, 4)
-	for {
-		details, _, err := stream.Recv()
-		if errors.Is(err, api.ErrEndOfStream) || errors.Is(err, api.ErrStreamClosed) {
-			break
-		}
+// LCPPairs returns Linux Control Plane pairs keyed by host_if_name. When the
+// lcp plugin is not loaded (message unknown or call fails), it returns an
+// empty map and a nil error so base interface inventory is never blocked.
+func (c *Client) LCPPairs(ctx context.Context) (map[string]mib.LCPPair, error) {
+	out := make(map[string]mib.LCPPair)
+	err := c.withConn(ctx, func(conn *core.Connection, rpcCtx context.Context) error {
+		svc := lcp.NewServiceClient(conn)
+		stream, err := svc.LcpItfPairGet(rpcCtx, &lcp.LcpItfPairGet{})
 		if err != nil {
-			if errors.Is(err, api.ErrUnknownMsg) {
-				return nil, ErrLCPUnavailable
-			}
-			return nil, fmt.Errorf("vpp: lcp_itf_pair_get recv: %w", err)
+			return err
 		}
-		out = append(out, newLCPPairFromDetails(details))
+		for {
+			d, _, err := stream.Recv()
+			if errors.Is(err, io.EOF) {
+				return nil
+			}
+			if err != nil {
+				return err
+			}
+			p := lcpFromDetails(d)
+			out[p.HostIfName] = p
+		}
+	})
+	if err != nil {
+		// Plugin missing or incompatible schema: report no pairs, keep going.
+		c.log.Debug("vpp: LCP pairs unavailable", "err", err)
+		return map[string]mib.LCPPair{}, nil
 	}
 	return out, nil
+}
+
+// InterfaceCounters returns interface names in statseg /if/names order and a
+// matching slice of summed counters. Retries once after reconnecting the stats
+// client if the segment dropped.
+func (c *Client) InterfaceCounters(ctx context.Context) ([]string, []mib.CounterSet, error) {
+	st, err := c.stats.Dump()
+	if err != nil {
+		c.log.Debug("vpp: stats dump failed, reconnecting", "err", err)
+		c.stats.Reset()
+		st, err = c.stats.Dump()
+		if err != nil {
+			return nil, nil, err
+		}
+	}
+	return countersFromStats(st)
+}
+
+// withConn runs fn against a live connection, reconnecting once if govpp
+// reports the connection dropped mid-call.
+func (c *Client) withConn(ctx context.Context, fn func(*core.Connection, context.Context) error) error {
+	conn, err := c.connection(ctx)
+	if err != nil {
+		return err
+	}
+	rpcCtx, cancel := context.WithTimeout(detach(ctx), c.opts.Timeout)
+	defer cancel()
+	err = fn(conn, rpcCtx)
+	if err == nil {
+		return nil
+	}
+	if !isConnError(err) {
+		return err
+	}
+	// Force a fresh connection and retry once.
+	c.mu.Lock()
+	if c.conn == conn {
+		conn.Disconnect()
+		c.conn = nil
+	}
+	c.mu.Unlock()
+	if cerr := c.connectAPI(ctx); cerr != nil {
+		return fmt.Errorf("%w (reconnect: %v)", err, cerr)
+	}
+	conn, err2 := c.connection(ctx)
+	if err2 != nil {
+		return err2
+	}
+	rpcCtx2, cancel2 := context.WithTimeout(detach(ctx), c.opts.Timeout)
+	defer cancel2()
+	return fn(conn, rpcCtx2)
+}
+
+func (c *Client) connection(ctx context.Context) (*core.Connection, error) {
+	c.mu.Lock()
+	conn, closed := c.conn, c.closed
+	c.mu.Unlock()
+	if conn == nil && !closed {
+		if err := c.connectAPI(ctx); err != nil {
+			return nil, err
+		}
+		c.mu.Lock()
+		conn = c.conn
+		c.mu.Unlock()
+	}
+	if conn == nil {
+		return nil, core.ErrNotConnected
+	}
+	return conn, nil
+}
+
+// isConnError reports whether err indicates a broken transport rather than a
+// VPP semantic error, so retrying after reconnect is worthwhile.
+func isConnError(err error) bool {
+	if errors.Is(err, core.ErrNotConnected) {
+		return true
+	}
+	var vppErr api.VPPApiError
+	if errors.As(err, &vppErr) {
+		return false
+	}
+	return true
+}
+
+// detach returns ctx if it has a deadline, else context.Background() so the
+// caller's timeout wrapper controls cancellation.
+func detach(ctx context.Context) context.Context {
+	if ctx == nil {
+		return context.Background()
+	}
+	return ctx
 }
