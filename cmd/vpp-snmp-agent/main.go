@@ -18,12 +18,17 @@ import (
 	vppsnmpagent "github.com/santainetwork/vpp-snmp-agent/internal/app"
 )
 
+var version = "dev"
+
 const (
 	defaultAddress = "localhost:705"
 	defaultPeriod  = 30 * time.Second
 )
 
 func main() {
+	var showVersion bool
+	flag.BoolVar(&showVersion, "version", false, "Print version and exit")
+	flag.BoolVar(&showVersion, "V", false, "Print version and exit")
 	var (
 		address     = flag.String("a", defaultAddress, "Location of the SNMPd agent (unix-path or host:port)")
 		period      = flag.String("p", defaultPeriod.String(), "Period to poll VPP (Go duration, e.g. 30s)")
@@ -43,6 +48,10 @@ Examples:
 	}
 
 	flag.Parse()
+	if showVersion {
+		fmt.Println(version)
+		return
+	}
 
 	pollPeriod, err := time.ParseDuration(*period)
 	if err != nil {

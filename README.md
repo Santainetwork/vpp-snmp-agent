@@ -25,7 +25,18 @@ repo builds a single static binary with no runtime Python dependency.
 
 ## Installation
 
-Latest release (requires Go 1.26+):
+Latest release prebuilds (Linux amd64 + arm64) are published at [GitHub Releases](https://github.com/Santainetwork/vpp-snmp-agent/releases). Download archive matching your server architecture, verify its `.sha256`, then install:
+```
+VERSION=v0.1.0
+ARCH=amd64 # or arm64
+curl -LO "https://github.com/Santainetwork/vpp-snmp-agent/releases/download/${VERSION}/vpp-snmp-agent-${VERSION}-linux-${ARCH}.tar.gz"
+curl -LO "https://github.com/Santainetwork/vpp-snmp-agent/releases/download/${VERSION}/vpp-snmp-agent-${VERSION}-linux-${ARCH}.tar.gz.sha256"
+sha256sum -c "vpp-snmp-agent-${VERSION}-linux-${ARCH}.tar.gz.sha256"
+tar -xzf "vpp-snmp-agent-${VERSION}-linux-${ARCH}.tar.gz"
+sudo install -m 0755 vpp-snmp-agent /usr/sbin/vpp-snmp-agent
+```
+
+Install from source (requires Go 1.26+):
 
 ```
 go install github.com/santainetwork/vpp-snmp-agent/cmd/vpp-snmp-agent@latest
@@ -46,7 +57,9 @@ go build -trimpath -ldflags="-s -w" -o vpp-snmp-agent ./cmd/vpp-snmp-agent
 sudo cp vpp-snmp-agent /usr/sbin/
 ```
 
-## Usage
+```
+vpp-snmp-agent -version
+```
 
 ```
 vpp-snmp-agent [options]
