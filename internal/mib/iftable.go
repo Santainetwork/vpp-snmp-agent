@@ -15,15 +15,11 @@ func ifTable(ds *agentx.DataSet, ifname string, idx, pos int, s Snapshot) {
 
 	ds.Set(fmt.Sprintf("%s.1.%d", ifTableRoot, idx), "int", int64(idx))
 
-	// ifName / ifAlias with LCP remapping
+	// ifName with LCP remapping (ifAlias lives in ifXTable only)
 	ifName := ifname
-	ifAlias := ""
 	if strings.HasPrefix(ifname, "tap") && haveIface {
-		if hostIfName, phyName, ok := lcpByHostSwIf(s, iface.SwIfIndex); ok {
+		if hostIfName, _, ok := lcpByHostSwIf(s, iface.SwIfIndex); ok {
 			ifName = hostIfName
-			if phyName != "" {
-				ifAlias = fmt.Sprintf("LCP %s (%s)", phyName, ifname)
-			}
 		}
 	}
 	ds.Set(fmt.Sprintf("%s.2.%d", ifTableRoot, idx), "str", ifName)
