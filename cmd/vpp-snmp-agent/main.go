@@ -57,7 +57,13 @@ Examples:
 		log.SetOutput(os.Stderr)
 	}
 
-	app, err := vppsnmpagent.New(*address, pollPeriod, *configPath, *debug, *agentxDebug)
+	app, err := vppsnmpagent.New(vppsnmpagent.Options{
+		AgentAddress: *address,
+		PollPeriod:   pollPeriod,
+		ConfigPath:   *configPath,
+		Debug:        *debug,
+		AgentXDebug:  *agentxDebug,
+	})
 	if err != nil {
 		log.Fatalf("vpp-snmp-agent: initialization failed: %v", err)
 	}
