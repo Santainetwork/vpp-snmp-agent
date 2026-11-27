@@ -6,8 +6,9 @@ import (
 	"strings"
 )
 
-// ValType mirrors the oid_type strings accepted by DataSet.set in dataset.py.
-type ValType string
+// ValType is the oid_type string set accepted by DataSet.Set (an alias so
+// Set(oid, "u32", v) and Set(oid, ValU32, v) both compile).
+type ValType = string
 
 const (
 	ValInt       ValType = "int"
@@ -40,13 +41,14 @@ func NewDataSet() *DataSet {
 func (d *DataSet) Set(oid string, t ValType, value any) {
 	var typ uint16
 	switch {
-	case strings.HasPrefix(string(t), "int"):
+	case strings.HasPrefix(t, "int"):
 		typ = TYPE_INTEGER
-	case strings.HasPrefix(string(t), "str"):
+		value = asInt64(value)
+	case strings.HasPrefix(t, "str"):
 		typ = TYPE_OCTETSTRING
-	case strings.HasPrefix(string(t), "oid"):
+	case strings.HasPrefix(t, "oid"):
 		typ = TYPE_OBJECTIDENTIFIER
-	case strings.HasPrefix(string(t), "ip"):
+	case strings.HasPrefix(t, "ip"):
 		typ = TYPE_IPADDRESS
 	case t == ValCounter32 || t == "uint32" || t == ValU32:
 		typ = TYPE_COUNTER32
@@ -54,16 +56,16 @@ func (d *DataSet) Set(oid string, t ValType, value any) {
 	case t == ValGauge32:
 		typ = TYPE_GAUGE32
 		value = asUint32(value)
-	case strings.HasPrefix(string(t), "time") || strings.HasPrefix(string(t), "tick"):
+	case strings.HasPrefix(t, "time") || strings.HasPrefix(t, "tick"):
 		typ = TYPE_TIMETICKS
-		value = asUint32(value)
-	case strings.HasPrefix(string(t), "opaque"):
+		value = asInt64(value)
+	case strings.HasPrefix(t, "opaque"):
 		typ = TYPE_OPAQUE
 	case t == ValCounter64 || t == "uint64" || t == ValU64:
 		typ = TYPE_COUNTER64
 		value = asUint64(value)
 	default:
-		panic("agentx: invalid oid_type: " + string(t))
+		panic("agentx: invalid oid_type: " + t)
 	}
 	if d.data == nil {
 		d.data = map[string]VarBind{}
